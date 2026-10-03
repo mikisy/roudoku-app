@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>朗読娘 — キャラクター動画スタジオ</title>
-  <link rel="stylesheet" href="/style.css?v=20260725-0002">
+  <link rel="stylesheet" href="/style.css?v=20260804-0005">
 </head>
 <body>
   <header class="topbar">
@@ -84,6 +84,18 @@
           <small id="aozoraStatus">XHTML版の本文とルビを取り込みます</small>
         </div>
         <textarea id="scriptInput" rows="10" spellcheck="true" placeholder="ここにキャラクターが話す文章を入力します。">こんにちは！朗読娘へようこそ。[happy] テキストと一枚の画像から、表情豊かなキャラクター動画を作れます。[surprised] とても簡単でしょう？</textarea>
+        <div class="learning-mode-panel">
+          <label>動画タイプ
+            <select id="contentMode"><option value="narration" selected>朗読動画</option><option value="japanese-learning">日本語学習動画（外国人向け）</option></select>
+          </label>
+          <div id="learningControls" hidden>
+            <label>各文の読み上げ回数
+              <select id="learningRepeat"><option value="1">1回</option><option value="2" selected>2回</option><option value="3">3回</option></select>
+            </label>
+            <label>読み上げ後のポーズ <output id="learningPauseOut">1.5秒</output><input id="learningPause" type="range" min="0" max="5" value="1.5" step="0.5"></label>
+            <small>日本語を文ごとに生成し、指定回数の反復と練習用ポーズを音声へ組み込みます。</small>
+          </div>
+        </div>
         <div class="translation-panel">
           <div><strong>英訳字幕</strong><small id="translationSummary">空欄なら表示しません</small></div>
           <div class="translation-metadata">
@@ -251,6 +263,6 @@
     </aside>
   </main>
 
-  <script type="module" src="/app.js?v=20260727-0002"></script>
+  <script type="module" src="/app.js?v=20260804-0004"></script>
 </body>
 </html>

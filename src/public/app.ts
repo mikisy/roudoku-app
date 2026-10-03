@@ -2,6 +2,7 @@ import { activeCaption, applyEnglishRuby, applyJapaneseRubyCorrections, captionC
 import { matchNearestTimelineAnchors, matchTimelineAnchors } from './alignment.js';
 import { createProjectBundle, maxProjectBundleBytes, readProjectBundle } from './project-bundle.js';
 import { playbackElapsed as playbackElapsedAtRate, playbackRate as selectedPlaybackRate } from './playback.js';
+import { learningPauseSeconds, learningRepeat, parseLearningCaptionTimes } from './learning.js';
 
 type Viseme = 'closed' | 'a' | 'i' | 'u' | 'e' | 'o';
 type SceneLayer = 'background' | 'character' | 'foreground';
@@ -95,6 +96,8 @@ function required<T extends Element>(selector: string): T {
 }
 
 const elements = {
+  main: required<HTMLElement>('main'),
+  stagePanel: required<HTMLElement>('.stage-panel'),
   canvas: required<HTMLCanvasElement>('#stage'),
   stageWrap: required<HTMLElement>('.stage-wrap'),
   stageExpand: required<HTMLButtonElement>('#stageExpand'),
@@ -110,6 +113,11 @@ const elements = {
   endingText: required<HTMLTextAreaElement>('#endingText'),
   endingDuration: required<HTMLInputElement>('#endingDuration'),
   script: required<HTMLTextAreaElement>('#scriptInput'),
+  contentMode: required<HTMLSelectElement>('#contentMode'),
+  learningControls: required<HTMLElement>('#learningControls'),
+  learningRepeat: required<HTMLSelectElement>('#learningRepeat'),
+  learningPause: required<HTMLInputElement>('#learningPause'),
+  learningPauseOut: required<HTMLOutputElement>('#learningPauseOut'),
   englishTitle: required<HTMLInputElement>('#englishTitle'),
   englishAuthor: required<HTMLInputElement>('#englishAuthor'),
   englishTranslation: required<HTMLTextAreaElement>('#englishTranslation'),
@@ -237,8 +245,8 @@ const legPartContext: CanvasRenderingContext2D = legPartContextCandidate;
 const defaultLayerOffsets: Record<'landscape' | 'portrait', Record<SceneLayer, LayerOffset>> = {
   landscape: {
     background: { x: 0, y: 0 },
-    character: { x: 431, y: 41 },
-    foreground: { x: 207, y: 145 }
+    character: { x: 410, y: 0 },
+    foreground: { x: 175, y: 95 }
   },
   portrait: {
     background: { x: 0, y: 0 },
@@ -309,6 +317,37 @@ const state: AppState = {
   reviewMarkers: [], reviewCueIndex: -2
 };
 
+function fitCanvasPreview(): void {
+  const availableWidth = elements.stageWrap.clientWidth;
+  const availableHeight = elements.stageWrap.clientHeight;
+  if (availableWidth <= 0 || availableHeight <= 0 || elements.canvas.width <= 0 || elements.canvas.height <= 0) return;
+  const aspectRatio = elements.canvas.width / elements.canvas.height;
+  let width = availableWidth;
+  let height = width / aspectRatio;
+  if (height > availableHeight) {
+    height = availableHeight;
+    width = height * aspectRatio;
+  }
+  const expanded = document.fullscreenElement === elements.stageWrap || elements.stageWrap.classList.contains('stage-expanded');
+  const previewScale = elements.videoLayout.value === 'portrait' && !expanded ? .78 : 1;
+  const displayWidth = Math.max(1, Math.floor(width * previewScale));
+  const displayHeight = Math.max(1, Math.floor(height * previewScale));
+  elements.canvas.style.width = `${displayWidth}px`;
+  elements.canvas.style.height = `${displayHeight}px`;
+  if (!expanded) {
+    const compact = window.innerWidth <= 1000;
+    const editorMinWidth = compact ? 370 : 430;
+    const panelMinWidth = compact ? 420 : elements.videoLayout.value === 'portrait' ? 430 : 500;
+    const panelChrome = Math.max(0, elements.stagePanel.clientWidth - elements.stageWrap.clientWidth);
+    const requestedPanelWidth = elements.videoLayout.value === 'portrait'
+      ? panelMinWidth
+      : Math.ceil(availableHeight * aspectRatio + panelChrome);
+    const availablePanelWidth = Math.max(panelMinWidth, window.innerWidth - editorMinWidth);
+    const panelWidth = Math.max(panelMinWidth, Math.min(requestedPanelWidth, availablePanelWidth));
+    elements.main.style.gridTemplateColumns = `${panelWidth}px minmax(${editorMinWidth}px,1fr)`;
+  }
+}
+
 function applyVideoLayout(resetOffsets = false): void {
   const portrait = elements.videoLayout.value === 'portrait';
   const layout = portrait ? 'portrait' : 'landscape';
@@ -322,6 +361,7 @@ function applyVideoLayout(resetOffsets = false): void {
   legPartCanvas.width = width;
   legPartCanvas.height = height;
   elements.stageWrap.dataset.layout = portrait ? 'portrait' : 'landscape';
+  requestAnimationFrame(fitCanvasPreview);
   if (changed && resetOffsets) {
     applyLayoutVisualDefaults(layout);
     state.layerOffsets.background = defaultLayerOffset('background');
@@ -439,9 +479,14 @@ function metadataNarration(): string {
   return [title ? `作品名、${spokenTitle}。` : '', author ? `著者、${spokenAuthor}。` : ''].filter(Boolean).join('');
 }
 
+function isJapaneseLearningMode(): boolean {
+  return elements.contentMode.value === 'japanese-learning';
+}
+
 function playbackScriptSource(): string {
-  const metadata = metadataNarration();
   const script = applyJapaneseRubyCorrections(elements.script.value, pronunciationReadings(false));
+  if (isJapaneseLearningMode()) return script;
+  const metadata = metadataNarration();
   return metadata ? `[neutral]${metadata} ${script}` : script;
 }
 
@@ -1434,6 +1479,10 @@ async function generateReviewMarkerAudio(marker: ReviewMarker): Promise<void> {
 }
 
 async function applyReviewMarkerAudio(marker: ReviewMarker): Promise<void> {
+  if (isJapaneseLearningMode()) {
+    notify('日本語学習モードでは文を反復しているため、修正後は音声全体を再生成してください。');
+    return;
+  }
   if (voiceGenerationController) return;
   const generated = reviewPreviewClips.get(marker.id);
   if (!generated) { notify('先にこの文を再生成して、音声を確認してください。'); return; }
@@ -1639,7 +1688,14 @@ function updateTranslationSummary(): void {
     : '空欄なら表示しません';
 }
 
+function updateLearningModeUi(): void {
+  const learning = isJapaneseLearningMode();
+  elements.learningControls.hidden = !learning;
+  document.body.classList.toggle('japanese-learning-mode', learning);
+}
+
 function englishCaptionAt(captionIndex: number): string {
+  if (isJapaneseLearningMode()) return translationAtCaption(elements.englishTranslation.value, captionIndex);
   const readings = pronunciationReadings(false);
   const title = elements.workTitle.value.trim();
   const author = elements.workAuthor.value.trim();
@@ -1710,10 +1766,83 @@ function drawEnglishCaption(caption: ActiveCaption, placement?: { belowJapanese?
   ctx.restore();
 }
 
+function drawJapaneseLearningCaption(caption: ActiveCaption): void {
+  const cue = state.captionCues[caption.index];
+  if (!cue) return;
+  const portrait = elements.videoLayout.value === 'portrait';
+  const japaneseSize = portrait ? 58 : 38;
+  const englishSize = portrait ? 37 : 25;
+  const panelX = elements.canvas.width * .06;
+  const panelWidth = elements.canvas.width * .88;
+  const innerWidth = panelWidth - japaneseSize * 1.4;
+  const requestedCenterY = elements.canvas.height * Number(elements.captionY.value) / 100;
+  const repeat = learningRepeat(elements.learningRepeat.value);
+  const currentRepeat = Math.min(repeat, Math.floor(Math.min(.9999, caption.progress) * repeat) + 1);
+  const english = englishCaptionAt(caption.index);
+
+  ctx.save();
+  ctx.font = `700 ${japaneseSize}px "Yu Mincho", YuMincho, "Hiragino Mincho ProN", "Noto Serif JP", serif`;
+  const japaneseLines = rubyCaptionLines(cue, innerWidth, japaneseSize);
+  ctx.font = `600 ${englishSize}px Inter, "Segoe UI", Arial, sans-serif`;
+  const englishLines = english ? captionLines(english, innerWidth) : [];
+  const japaneseLineHeight = japaneseSize * 1.65;
+  const englishLineHeight = englishSize * 1.35;
+  const headerHeight = portrait ? 54 : 38;
+  const gap = portrait ? 34 : 22;
+  const panelHeight = headerHeight + japaneseLines.length * japaneseLineHeight
+    + (englishLines.length ? gap + englishLines.length * englishLineHeight : 0) + japaneseSize * 1.25;
+  const panelY = Math.max(18, Math.min(elements.canvas.height - panelHeight - 18, requestedCenterY - panelHeight / 2));
+  const opacity = Math.min(smoothStep(caption.progress / .045), smoothStep((1 - caption.progress) / .045));
+
+  ctx.globalAlpha = opacity * .9;
+  ctx.fillStyle = 'rgba(10,13,10,.9)';
+  ctx.fillRect(panelX, panelY, panelWidth, panelHeight);
+  ctx.globalAlpha = opacity;
+  ctx.fillStyle = '#d8ff45';
+  ctx.font = `600 ${portrait ? 22 : 15}px ui-monospace, monospace`;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(`JAPANESE  ${caption.index + 1} / ${state.captionCues.length}`, panelX + japaneseSize * .7, panelY + headerHeight * .62);
+  ctx.textAlign = 'right';
+  ctx.fillText(`REPEAT ${currentRepeat} / ${repeat}`, panelX + panelWidth - japaneseSize * .7, panelY + headerHeight * .62);
+
+  ctx.font = `700 ${japaneseSize}px "Yu Mincho", YuMincho, "Hiragino Mincho ProN", "Noto Serif JP", serif`;
+  const japaneseTop = panelY + headerHeight + japaneseSize * .75;
+  japaneseLines.forEach((line, index) => drawRubyCaptionLine(
+    line,
+    panelX + japaneseSize * .7,
+    japaneseTop + index * japaneseLineHeight,
+    japaneseSize,
+    '#f7f5ee',
+    '#dff58b'
+  ));
+  if (englishLines.length) {
+    ctx.font = `500 ${englishSize}px Inter, "Segoe UI", Arial, sans-serif`;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#d6d3ca';
+    const englishTop = japaneseTop + japaneseLines.length * japaneseLineHeight - japaneseSize * .2 + gap;
+    englishLines.forEach((line, index) => ctx.fillText(
+      line,
+      panelX + japaneseSize * .7,
+      englishTop + index * englishLineHeight
+    ));
+  }
+  ctx.globalAlpha = opacity * .3;
+  ctx.fillStyle = '#d8ff45';
+  ctx.fillRect(panelX, panelY + panelHeight - 5, panelWidth, 5);
+  ctx.globalAlpha = opacity;
+  ctx.fillRect(panelX, panelY + panelHeight - 5, panelWidth * caption.progress, 5);
+  ctx.restore();
+}
+
 function drawReadingCaption(time: number): void {
   if (state.playbackPhase !== 'narration' || !elements.showCaptions.checked) return;
   const caption = activeCaptionForPlayback();
   if (!caption) return;
+  if (isJapaneseLearningMode()) {
+    drawJapaneseLearningCaption(caption);
+    return;
+  }
   if (elements.captionEffect.value === 'fixed-panel') {
     drawFixedReadingPanel(caption);
     drawEnglishCaption(caption);
@@ -1888,6 +2017,7 @@ function draw(time = performance.now() / 1000): void {
 
 function updateScript(): void {
   const source = elements.script.value;
+  updateLearningModeUi();
   state.captionCues = captionCues(playbackScriptSource());
   state.captionTimes = null;
   updateTranslationSummary();
@@ -1941,6 +2071,7 @@ function updateExpandButton(): void {
   elements.stageExpand.setAttribute('aria-pressed', String(expanded));
   elements.stageExpand.title = label;
   elements.stageExpand.querySelector('span')!.textContent = expanded ? '×' : '⛶';
+  requestAnimationFrame(fitCanvasPreview);
 }
 
 async function toggleStageFullscreen(): Promise<void> {
@@ -2644,7 +2775,7 @@ function cancelExport(): void {
 
 const projectFieldIds = [
   'workTitle', 'workAuthor', 'workPublication', 'openingText', 'openingDuration', 'endingText', 'endingDuration',
-  'aozoraUrl', 'scriptInput', 'englishTitle', 'englishAuthor', 'englishTranslation', 'pronunciationCorrections', 'ttsEngine', 'irodoriVoice', 'irodoriCaption', 'irodoriQuality', 'irodoriAttackFade',
+  'aozoraUrl', 'scriptInput', 'contentMode', 'learningRepeat', 'learningPause', 'englishTitle', 'englishAuthor', 'englishTranslation', 'pronunciationCorrections', 'ttsEngine', 'irodoriVoice', 'irodoriCaption', 'irodoriQuality', 'irodoriAttackFade',
   'voiceSpeed', 'speakerId', 'previewSpeed', 'showCaptions', 'videoLayout', 'captionEffect', 'captionSize', 'captionX', 'captionY',
   'characterScale', 'backgroundScale', 'foregroundScale', 'characterMotion', 'hairMotion', 'legMotion',
   'mouthX', 'mouthY', 'mouthSize', 'useMouthSprites', 'bgmPreset', 'bgmVolume', 'bgmLoop',
@@ -3070,6 +3201,17 @@ elements.videoLayout.addEventListener('change', () => {
   applyVideoLayout(true);
   void syncDefaultBackgroundToLayout();
 });
+elements.contentMode.addEventListener('change', () => {
+  if (isJapaneseLearningMode() && elements.videoLayout.value !== 'portrait') {
+    elements.videoLayout.value = 'portrait';
+    elements.videoLayout.dispatchEvent(new Event('change'));
+  }
+  updateScript();
+});
+elements.learningRepeat.addEventListener('change', () => draw());
+elements.learningPause.addEventListener('input', () => {
+  elements.learningPauseOut.textContent = `${learningPauseSeconds(elements.learningPause.value).toFixed(1)}秒`;
+});
 elements.captionEffect.addEventListener('change', () => draw());
 (['captionSize', 'captionX', 'captionY'] as const).forEach(id => elements[id].addEventListener('input', () => {
   const suffix = id === 'captionSize' ? 'px' : '%';
@@ -3326,6 +3468,57 @@ async function fetchSpeech(text: string, signal: AbortSignal): Promise<{ blob: B
   return { blob: await response.blob(), name: request.name, timeline };
 }
 
+async function combineLearningSpeech(
+  clips: readonly Blob[],
+  repeat: number,
+  pauseSeconds: number,
+  signal: AbortSignal
+): Promise<{ blob: Blob; times: number[] }> {
+  const manifest = {
+    clips: clips.map(clip => ({ size: clip.size })),
+    repeat,
+    pauseSeconds
+  };
+  const response = await fetch('/api/audio/learning-sequence', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'x-roudoku-learning': base64Url(JSON.stringify(manifest))
+    },
+    body: new Blob([...clips]),
+    signal
+  });
+  if (!response.ok) {
+    const data = await response.json() as { error?: string; detail?: string };
+    throw new Error(data.detail ?? data.error ?? '日本語学習用の音声を結合できませんでした。');
+  }
+  const times = parseLearningCaptionTimes(response.headers.get('x-roudoku-caption-times'), clips.length);
+  if (!times) throw new Error('日本語学習用の字幕時刻を読み取れませんでした。');
+  return { blob: await response.blob(), times };
+}
+
+async function generateJapaneseLearningVoice(scriptSource: string, controller: AbortController): Promise<void> {
+  const cues = captionCues(scriptSource);
+  if (cues.length > 100) throw new Error('日本語学習動画は一度に100文まで生成できます。台本を分けてください。');
+  const translations = translationLines(elements.englishTranslation.value);
+  if (translations.length !== cues.length) {
+    throw new Error(`英訳を日本語字幕と同じ${cues.length}行入力してください（現在${translations.length}行）。`);
+  }
+  const clips: Blob[] = [];
+  for (const [index, cue] of cues.entries()) {
+    const progress = `学習音声を生成中 ${index + 1}/${cues.length}`;
+    elements.statusText.textContent = progress;
+    elements.generateVoice.textContent = progress;
+    elements.generateVoiceFromScript.textContent = progress;
+    clips.push((await fetchSpeech(cue.spoken, controller.signal)).blob);
+  }
+  elements.statusText.textContent = '反復と練習用ポーズを結合中…';
+  const repeat = learningRepeat(elements.learningRepeat.value);
+  const pauseSeconds = learningPauseSeconds(elements.learningPause.value);
+  const combined = await combineLearningSpeech(clips, repeat, pauseSeconds, controller.signal);
+  await loadAudio(combined.blob, '日本語学習音声.wav', scriptSource, { times: combined.times });
+}
+
 function stopPronunciationPreview(): void {
   pronunciationPreviewAudio?.pause();
   pronunciationPreviewAudio = null;
@@ -3449,6 +3642,10 @@ async function generateScriptVoice(): Promise<boolean> {
   setVoiceGenerationState(true);
   try {
     const scriptSource = playbackScriptSource();
+    if (isJapaneseLearningMode()) {
+      await generateJapaneseLearningVoice(scriptSource, controller);
+      return true;
+    }
     const generated = await fetchSpeech(plainText(scriptSource), controller.signal);
     await loadAudio(generated.blob, generated.name, scriptSource, generated.timeline ? { chunks: generated.timeline } : undefined);
     return true;
@@ -3490,6 +3687,10 @@ function base64Url(value: string): string {
 }
 
 async function repairPronunciationAudio(): Promise<void> {
+  if (isJapaneseLearningMode()) {
+    notify('日本語学習モードでは文を反復しているため、読みを直した後に音声全体を再生成してください。');
+    return;
+  }
   if (voiceGenerationController) return;
   if (state.playing) stopPlayback(true);
   if (!state.audioBlob || !state.audioScriptSource) {
@@ -3821,6 +4022,8 @@ elements.timeline.addEventListener('keydown', event => {
 });
 elements.stageExpand.addEventListener('click', () => { void toggleStageFullscreen(); });
 document.addEventListener('fullscreenchange', updateExpandButton);
+const stageResizeObserver = new ResizeObserver(() => fitCanvasPreview());
+stageResizeObserver.observe(elements.stageWrap);
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && elements.stageWrap.classList.contains('stage-expanded')) {
     elements.stageWrap.classList.remove('stage-expanded');

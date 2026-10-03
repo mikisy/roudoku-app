@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { pipeline } from 'node:stream/promises';
 import { aozoraFirstPublication, aozoraUrl, findAozoraXhtml, isAozoraXhtml } from './aozora.js';
 import { encodeIrodoriTimeline, irodoriAttackFadeMs, irodoriPauseMs, irodoriPayload, parseIrodoriSse, splitIrodoriText, wavDurationSeconds, type IrodoriSpeechRequest, type IrodoriTimelineChunk } from './irodori.js';
+import { learningCaptionTimes, learningPauseSeconds, learningRepeat } from './public/learning.js';
 
 const port = Number(process.env.PORT || 4173);
 const publicDir = join(import.meta.dirname, 'public');
@@ -70,6 +71,7 @@ interface VoicevoxRequest { text?: string; speaker?: number; speedScale?: number
 interface VoicevoxQuery { speedScale: number; [key: string]: unknown }
 interface AozoraRequest { url?: string }
 interface AudioRepairRange { start: number; end: number; size: number }
+interface LearningAudioManifest { clips?: Array<{ size?: number }>; repeat?: number; pauseSeconds?: number }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -423,6 +425,95 @@ async function repairAudio(req: IncomingMessage, res: ServerResponse): Promise<v
   }
 }
 
+function learningAudioManifest(req: IncomingMessage): { sizes: number[]; repeat: number; pauseSeconds: number } {
+  const encoded = req.headers['x-roudoku-learning'];
+  if (typeof encoded !== 'string' || encoded.length > 16_384) throw new Error('学習音声の結合情報がありません');
+  const value = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as LearningAudioManifest;
+  if (!Array.isArray(value.clips) || value.clips.length < 1 || value.clips.length > 100) {
+    throw new Error('学習音声は1〜100文で指定してください');
+  }
+  const sizes = value.clips.map((clip, index) => {
+    const size = Number(clip.size);
+    if (!Number.isSafeInteger(size) || size < 44 || size > 100 * 1024 * 1024) {
+      throw new Error(`学習音声${index + 1}のサイズが不正です`);
+    }
+    return size;
+  });
+  return {
+    sizes,
+    repeat: learningRepeat(value.repeat),
+    pauseSeconds: learningPauseSeconds(value.pauseSeconds)
+  };
+}
+
+async function sequenceLearningAudio(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const dir = await mkdtemp(join(tmpdir(), 'roudoku-learning-'));
+  const combined = join(dir, 'clips.bin');
+  const listPath = join(dir, 'sequence.txt');
+  const output = join(dir, 'learning.wav');
+  const clientAbort = new AbortController();
+  res.once('close', () => { if (!res.writableEnded) clientAbort.abort(); });
+  try {
+    const manifest = learningAudioManifest(req);
+    await requestToFile(req, combined, maxVideoUpload);
+    const combinedInfo = await stat(combined);
+    const expectedBytes = manifest.sizes.reduce((sum, size) => sum + size, 0);
+    if (combinedInfo.size !== expectedBytes) throw new Error('学習音声データのサイズが一致しません');
+
+    let offset = 0;
+    const normalizedPaths: string[] = [];
+    const durations: number[] = [];
+    for (const [index, size] of manifest.sizes.entries()) {
+      const source = join(dir, `source-${index}.wav`);
+      const normalized = join(dir, `clip-${index}.wav`);
+      await pipeline(createReadStream(combined, { start: offset, end: offset + size - 1 }), createWriteStream(source));
+      await run('ffmpeg', [
+        '-y', '-i', source, '-vn',
+        '-af', 'silenceremove=stop_periods=1:stop_duration=0.2:stop_threshold=-50dB',
+        '-ar', '48000', '-ac', '1', '-c:a', 'pcm_s16le', normalized
+      ], clientAbort.signal);
+      normalizedPaths.push(normalized);
+      durations.push(wavDurationSeconds(await readFile(normalized)));
+      offset += size;
+    }
+
+    const pausePath = join(dir, 'practice-pause.wav');
+    if (manifest.pauseSeconds > 0) {
+      await run('ffmpeg', [
+        '-y', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=mono',
+        '-t', String(manifest.pauseSeconds), '-c:a', 'pcm_s16le', pausePath
+      ], clientAbort.signal);
+    }
+    const list: string[] = [];
+    normalizedPaths.forEach(path => {
+      for (let repeat = 0; repeat < manifest.repeat; repeat += 1) {
+        list.push(`file '${path}'`);
+        if (manifest.pauseSeconds > 0) list.push(`file '${pausePath}'`);
+      }
+    });
+    await writeFile(listPath, `${list.join('\n')}\n`);
+    await run('ffmpeg', [
+      '-y', '-f', 'concat', '-safe', '0', '-i', listPath,
+      '-vn', '-ar', '48000', '-ac', '1', '-c:a', 'pcm_s16le', output
+    ], clientAbort.signal);
+    const captionTimes = learningCaptionTimes(durations, manifest);
+    if (!captionTimes) throw new Error('学習字幕の時刻を作成できませんでした');
+    const audio = await stat(output);
+    res.writeHead(200, {
+      'content-type': 'audio/wav',
+      'content-length': audio.size,
+      'x-roudoku-caption-times': captionTimes.map(time => time.toFixed(6)).join(',')
+    });
+    await pipeline(createReadStream(output), res);
+  } catch (error) {
+    if (!clientAbort.signal.aborted && !res.destroyed && !res.headersSent) {
+      json(res, 500, { error: '日本語学習用の音声を結合できませんでした', detail: errorMessage(error) });
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 async function declickAudio(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), 'roudoku-audio-declick-'));
   const input = join(dir, 'original-audio');
@@ -509,6 +600,7 @@ createServer(async (req, res) => {
     if (req.method === 'POST' && req.url === '/api/aozora') return await importAozora(req, res);
     if (req.method === 'POST' && req.url === '/api/export') return await convert(req, res);
     if (req.method === 'POST' && req.url === '/api/audio/repair') return await repairAudio(req, res);
+    if (req.method === 'POST' && req.url === '/api/audio/learning-sequence') return await sequenceLearningAudio(req, res);
     if (req.method === 'POST' && req.url === '/api/audio/declick') return await declickAudio(req, res);
     if (req.method === 'POST' && req.url === '/api/audio/deess') return await deessAudio(req, res);
     if (req.method === 'GET' && req.url === '/api/irodori/health') return await irodoriHealth(res);
